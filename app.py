@@ -11,58 +11,75 @@ import cv2
 from huggingface_hub import hf_hub_download
 from safetensors.torch import load_file
 
-# Image processing function
-def process_image(image, model, device):
+# 画像処理関数（カラーマップを引数で受け取る）
+def process_image(image, model, device, cmap):
     if model is None:
         return None
-    
-    # Preprocess the image
-    image_np = np.array(image)[..., ::-1] / 255
-    
-    transform = Compose([
-        Resize(700, 700, resize_target=False, keep_aspect_ratio=False, ensure_multiple_of=14, resize_method='lower_bound', image_interpolation_method=cv2.INTER_CUBIC),
-        NormalizeImage(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-        PrepareForNet()
-    ])
-    
-    image_tensor = transform({'image': image_np})['image']
-    image_tensor = torch.from_numpy(image_tensor).unsqueeze(0).to(device)
-    
-    with torch.no_grad():  # Disable autograd since we don't need gradients on CPU
-        pred_disp, _ = model(image_tensor)
-    torch.cuda.empty_cache()
 
-    # Ensure the depth map is in the correct shape before colorization
-    pred_disp_np = pred_disp.cpu().detach().numpy()[0, 0, :, :]  # Remove extra singleton dimensions
+    # 画像の前処理
+    image = image.convert("RGB")
+    image_np = np.array(image)[..., ::-1] / 255
+
+    # Dynamically resize based on the image's short side
+    h, w = image_np.shape[:2]
+    short_side = min(h, w)
+    # Ensure the target size is a multiple of 14 and at least 14
+    target_size = max(1, short_side // 14) * 14
+
+    resize_transform = Resize(
+        width=target_size,
+        height=target_size,
+        resize_target=False,
+        keep_aspect_ratio=True,
+        ensure_multiple_of=14,
+        resize_method='lower_bound',
+        image_interpolation_method=cv2.INTER_CUBIC
+    )
     
-    # Normalize depth map
+    normalize_transform = NormalizeImage(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    prepare_for_net_transform = PrepareForNet()
+
+    # Apply transformations sequentially
+    sample = {'image': image_np}
+    sample = resize_transform(sample)
+    sample = normalize_transform(sample)
+    sample = prepare_for_net_transform(sample)
+    
+    image_tensor = torch.from_numpy(sample['image']).unsqueeze(0).to(device)
+
+    with torch.no_grad():
+        pred_disp, _ = model(image_tensor)
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+
+    # 深度マップの整形と正規化
+    pred_disp_np = pred_disp.cpu().detach().numpy()[0, 0, :, :]
     pred_disp = (pred_disp_np - pred_disp_np.min()) / (pred_disp_np.max() - pred_disp_np.min())
-    
-    # Colorize depth map
-    cmap = "Spectral_r"
-    depth_colored = colorize_depth_maps(pred_disp[None, ..., None], 0, 1, cmap=cmap).squeeze()  # Ensure correct dimension
-    
-    # Convert to uint8 for image display
+
+    # カラーマップで色付け
+    depth_colored = colorize_depth_maps(pred_disp[None, ..., None], 0, 1, cmap=cmap).squeeze()
+
+    # 0-255 の uint8 に変換し、チャネル順を変換
     depth_colored = (depth_colored * 255).astype(np.uint8)
-    
-    # Convert to HWC format (height, width, channels)
     depth_colored_hwc = chw2hwc(depth_colored)
-    
-    # Resize to match the original image dimensions (height, width)
+
+    # 元画像と同じサイズにリサイズ
     h, w = image_np.shape[:2]
     depth_colored_hwc = cv2.resize(depth_colored_hwc, (w, h), cv2.INTER_LINEAR)
-    
-    # Convert to a PIL image
+
+    # PIL 画像に変換して返す
     depth_image = Image.fromarray(depth_colored_hwc)
     return depth_image
 
-# Gradio interface function
-def gradio_interface(image, model_size):
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    # 根据用户选择的模型大小加载不同的配置
-    model_kwargs = {
-        "large": dict(
+# モデルのロード処理（シングルトンにすることで複数関数から使い回し可能）
+def load_depth_model(device):
+    model_kwargs = dict(
+        vitb=dict(
+            encoder='vitb',
+            features=128,
+            out_channels=[96, 192, 384, 768],
+        ),
+        vitl=dict(
             encoder="vitl", 
             features=256, 
             out_channels=[256, 512, 1024, 1024], 
@@ -72,56 +89,91 @@ def gradio_interface(image, model_size):
             mode='disparity',
             pretrain_type='dinov2',
             del_mask_token=False
-        ),
-        "base": dict(
-            encoder='vitb',
-            features=128,
-            out_channels=[96, 192, 384, 768],
-        ),
-        "small": dict(
-            encoder='vits',
-            features=64,
-            out_channels=[48, 96, 192, 384],
         )
-    }
-
-    # 根据用户选择的模型大小加载对应的 checkpoint
-    if model_size == "large":
-        checkpoint_path = hf_hub_download(repo_id=f"xingyang1/Distill-Any-Depth", filename=f"large/model.safetensors", repo_type="model")
-    elif model_size == "base":
-        checkpoint_path = hf_hub_download(repo_id=f"xingyang1/Distill-Any-Depth", filename=f"base/model.safetensors", repo_type="model")
-    elif model_size == "small":
-        checkpoint_path = hf_hub_download(repo_id=f"xingyang1/Distill-Any-Depth", filename=f"small/model.safetensors", repo_type="model")
-    else:
-        raise ValueError(f"Unknown model size: {model_size}")
-
-    # 加载模型
-    if model_size == "large":
-        model = DepthAnything(**model_kwargs[model_size]).to(device)
-    else:
-        model = DepthAnythingV2(**model_kwargs[model_size]).to(device)
+    )
+    model = DepthAnything(**model_kwargs['vitl']).to(device)
+    # hf_hub_download を使う場合の例（コメントアウト）
+    # checkpoint_path = hf_hub_download(repo_id=f"xingyang1/Distill-Any-Depth", filename=f"large/model.safetensors", repo_type="model")
+    
+    # ローカルパスの場合（環境に合わせて変更）
+    checkpoint_path = "D:\\AI\\Distill-Any-Depth\\model.safetensors"
     model_weights = load_file(checkpoint_path)
     model.load_state_dict(model_weights)
     model = model.to(device)
+    return model
+
+# 単一画像処理用のGradioインターフェイス関数
+def gradio_interface_single(image, cmap):
+    device = get_device()
+    model = load_depth_model(device)
     
-    if model is None:
-        return None
+    # 深度画像の生成
+    depth_image = process_image(image, model, device, cmap)
     
-    # 处理图像并返回结果
-    depth_image = process_image(image, model, device)
+    # 入力画像と出力画像の保存処理（ファイル名に現在時刻を利用）
+    output_dir = "output"
+    os.makedirs(output_dir, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    input_filename = os.path.join(output_dir, f"{timestamp}.png")
+    output_filename = os.path.join(output_dir, f"{timestamp}_depth.png")
+    image.save(input_filename)
+    depth_image.save(output_filename)
+    
     return depth_image
 
-# 创建 Gradio 界面
-iface = gr.Interface(
-    fn=gradio_interface,
-    inputs=[
-        gr.Image(type="pil"),  # 图像输入
-        gr.Dropdown(choices=["large", "base", "small"], label="Model Size", value="large")  # 模型大小选择
-    ],
-    outputs=gr.Image(type="pil"),  # 深度图输出
-    title="Depth Estimation Demo",
-    description="Upload an image and select a model size (large, base, or small) to see the depth estimation results."
-)
+# フォルダ内の画像を一括処理する関数
+def gradio_interface_batch(folder_path, cmap):
+    device = get_device()
+    model = load_depth_model(device)
+    
+    output_dir = "output"
+    os.makedirs(output_dir, exist_ok=True)
+    # 対象となる画像拡張子
+    extensions = ["*.png", "*.jpg", "*.jpeg"]
+    files = []
+    for ext in extensions:
+        files.extend(glob.glob(os.path.join(folder_path, ext)))
+    
+    if not files:
+        return "指定されたフォルダに画像が見つかりませんでした。"
+    
+    # 各画像を処理
+    for file in files:
+        try:
+            image = Image.open(file)
+        except Exception as e:
+            print(f"Failed to open {file}: {e}")
+            continue
+        depth_image = process_image(image, model, device, cmap)
+        # 元ファイル名に _depth を付加して保存
+        base = os.path.basename(file)
+        name, ext = os.path.splitext(base)
+        output_filename = os.path.join(output_dir, f"{name}_depth{ext}")
+        depth_image.save(output_filename)
+    return f"バッチ処理が完了しました。出力は {output_dir} フォルダに保存されました。"
 
-# 启动 Gradio 界面
-iface.launch()
+# Gradio インターフェイスのタブ化
+with gr.Blocks() as demo:
+    gr.Markdown("# Depth Estimation Demo")
+    
+    with gr.Tab("単一画像処理"):
+        gr.Markdown("入力画像とカラーマップを選択して深度推定を行います。")
+        with gr.Row():
+            input_image = gr.Image(type="pil", label="入力画像")
+            cmap_single = gr.Dropdown(choices=["Spectral_r", "gray", "viridis", "plasma", "inferno", "magma"],
+                                      value="Spectral_r", label="カラーマップ")
+        output_image = gr.Image(type="pil", label="深度推定結果")
+        single_btn = gr.Button("処理開始")
+        single_btn.click(gradio_interface_single, inputs=[input_image, cmap_single], outputs=output_image)
+    
+    with gr.Tab("フォルダ内一括処理"):
+        gr.Markdown("フォルダパスを入力して、そのフォルダ内のすべての画像を一括で処理します。\n出力画像は各ファイル名に _depth を付加して保存されます。")
+        folder_path = gr.Textbox(label="画像フォルダのパス", placeholder="例: D:\\Images")
+        cmap_batch = gr.Dropdown(choices=["Spectral_r", "gray", "viridis", "plasma", "inferno", "magma"],
+                                 value="Spectral_r", label="カラーマップ")
+        batch_btn = gr.Button("バッチ処理開始")
+        batch_output = gr.Textbox(label="処理結果メッセージ")
+        batch_btn.click(gradio_interface_batch, inputs=[folder_path, cmap_batch], outputs=batch_output)
+
+# Gradio インターフェイスの起動
+demo.launch()
