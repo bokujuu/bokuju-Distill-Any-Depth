@@ -1,3 +1,11 @@
+## フォークの変更点
+
+本リポジトリは [Westlake-AGI-Lab/Distill-Any-Depth](https://github.com/Westlake-AGI-Lab/Distill-Any-Depth) をベースに、以下の機能を追加しています:
+
+- 画像の短辺に基づく動的リサイズを導入し、処理品質を調整
+- Gradio デモに単一画像処理とフォルダ内一括処理の両タブを実装
+- カラーマップ選択や処理結果の自動保存などの UI 拡張
+
 <div align="center">
 <h1>Distill Any Depth: 
   Distillation Creates a Stronger Monocular Depth Estimator
